@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable, Optional
 import aiohttp
 import websockets
 
-from src.constants import POLYGON_WSS_URL
+from src.constants import POLYGON_WSS_URL, RECONNECT_MAX_DELAY
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -25,6 +25,8 @@ class PolygonClient:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._request_id = 0
+        self._last_block_time = 0
+        self.reconnect_count = 0
 
     def _next_id(self) -> int:
         """Generate next JSON-RPC request ID."""
@@ -40,8 +42,10 @@ class PolygonClient:
 
             self._ws = await websockets.connect(
                 self.wss_url,
-                ping_interval=30,
-                ping_timeout=10,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                max_queue=None,
                 ssl=ssl_context,
             )
             log.info("WebSocket connected")
@@ -107,26 +111,45 @@ class PolygonClient:
     async def subscribe_blocks(
         self, callback: Callable[[int], Awaitable[None]]
     ) -> None:
-        """Subscribe to new block headers via WebSocket."""
-        if not self._ws:
-            await self.connect()
+        """Subscribe to new block headers via WebSocket with automatic reconnect."""
+        reconnect_delay = 1
+        while True:
+            try:
+                if not self._ws:
+                    await self.connect()
 
-        # Subscribe to newHeads
-        subscribe_msg = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "eth_subscribe",
-            "params": ["newHeads"],
-        }
-        await self._ws.send(json.dumps(subscribe_msg))
-        await self._ws.recv()  # subscription confirmation
+                # Subscribe to newHeads
+                subscribe_msg = {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "eth_subscribe",
+                    "params": ["newHeads"],
+                }
+                await self._ws.send(json.dumps(subscribe_msg))
+                await self._ws.recv()  # subscription confirmation
 
-        # Listen for new blocks
-        async for message in self._ws:
-            data = json.loads(message)
-            if "params" in data:
-                block_number = int(data["params"]["result"]["number"], 16)
-                await callback(block_number)
+                self._last_block_time = asyncio.get_event_loop().time()
+
+                # Listen for new blocks
+                async for message in self._ws:
+                    data = json.loads(message)
+                    if "params" in data:
+                        block_number = int(data["params"]["result"]["number"], 16)
+                        self._last_block_time = asyncio.get_event_loop().time()
+                        await callback(block_number)
+
+                    # Watchdog check
+                    now = asyncio.get_event_loop().time()
+                    if now - self._last_block_time > 60:
+                        log.warning("No block received for 60s, forcing reconnect")
+                        raise Exception("Watchdog timeout")
+
+            except Exception as e:
+                log.error("WebSocket error, reconnecting", error=str(e))
+                self.reconnect_count += 1
+                await self.disconnect()
+                await asyncio.sleep(min(reconnect_delay, RECONNECT_MAX_DELAY))
+                reconnect_delay *= 2
 
     async def get_block_with_transactions(self, block_number: int) -> dict:
         """Fetch full block with all transactions."""

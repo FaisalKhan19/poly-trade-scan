@@ -1,4 +1,5 @@
 """Block processing for trade extraction."""
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -35,8 +36,9 @@ class BlockProcessor:
     async def process_block(self, block_number: int) -> list[TradeData]:
         """Process all transactions in a block."""
         trades = []
-        block = await self.client.get_block_with_transactions(block_number)
-        receipts = await self.client.get_block_receipts(block_number)
+        block_task = self.client.get_block_with_transactions(block_number)
+        receipts_task = self.client.get_block_receipts(block_number)
+        block, receipts = await asyncio.gather(block_task, receipts_task)
 
         # Extract block timestamp (hex Unix epoch → ISO 8601)
         block_ts = int(block["timestamp"], 16)
